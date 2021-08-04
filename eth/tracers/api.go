@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/big"
 	"os"
 	"runtime"
 	"sync"
@@ -487,7 +488,7 @@ func (api *API) traceBlock(ctx context.Context, block *types.Block, config *Trac
 	if err != nil {
 		return nil, err
 	}
-	reexec := defaultTraceReexec
+	reexec := defaultTraceReexec //最多重算这么多块以前的状态
 	if config != nil && config.Reexec != nil {
 		reexec = *config.Reexec
 	}
@@ -497,66 +498,49 @@ func (api *API) traceBlock(ctx context.Context, block *types.Block, config *Trac
 	}
 	// Execute all the transaction contained within the block concurrently
 	var (
-		signer  = types.MakeSigner(api.backend.ChainConfig(), block.Number())
-		txs     = block.Transactions()
-		results = make([]*txTraceResult, len(txs))
-
-		pend = new(sync.WaitGroup)
-		jobs = make(chan *txTraceTask, len(txs))
+		signer = types.MakeSigner(api.backend.ChainConfig(), block.Number())
+		txs    = block.Transactions()
 	)
-	threads := runtime.NumCPU()
-	if threads > len(txs) {
-		threads = len(txs)
-	}
 	blockCtx := core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
-	blockHash := block.Hash()
-	for th := 0; th < threads; th++ {
-		pend.Add(1)
-		go func() {
-			defer pend.Done()
-			// Fetch and execute the next transaction trace tasks
-			for task := range jobs {
-				msg, _ := txs[task.index].AsMessage(signer, block.BaseFee())
-				txctx := &Context{
-					BlockHash: blockHash,
-					TxIndex:   task.index,
-					TxHash:    txs[task.index].Hash(),
-				}
-				res, err := api.traceTx(ctx, msg, txctx, blockCtx, task.statedb, config)
-				if err != nil {
-					results[task.index] = &txTraceResult{Error: err.Error()}
-					continue
-				}
-				results[task.index] = &txTraceResult{Result: res}
-			}
-		}()
-	}
 	// Feed the transactions into the tracers and return
-	var failed error
+	type DebugResult struct {
+		MessageResult []*core.ExecutionResult
+		Storage       map[common.Address]map[common.Hash]common.Hash
+		Balance       map[common.Address]*big.Int
+		Logs          map[common.Hash][]*types.Log
+	}
+	var Results DebugResult
+	Results.Balance = make(map[common.Address]*big.Int)
+	Results.Logs = make(map[common.Hash][]*types.Log)
+	Results.Storage = make(map[common.Address]map[common.Hash]common.Hash)
 	for i, tx := range txs {
-		// Send the trace task over for execution
-		jobs <- &txTraceTask{statedb: statedb.Copy(), index: i}
-
 		// Generate the next state snapshot fast without tracing
 		msg, _ := tx.AsMessage(signer, block.BaseFee())
 		statedb.Prepare(tx.Hash(), i)
 		vmenv := vm.NewEVM(blockCtx, core.NewEVMTxContext(msg), statedb, api.backend.ChainConfig(), vm.Config{})
-		if _, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas())); err != nil {
-			failed = err
-			break
+		temp, _ := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas()))
+		Results.MessageResult = append(Results.MessageResult, temp)
+		statedb.Finalise(vmenv.ChainConfig().IsEIP158(block.Number())) //清除废弃状态（不写库，Commit是写库）
+	}
+	stateObjects := statedb.GetstateObjects()
+	for key, val := range stateObjects {
+		pendingStorage := val.GetpendingStorage()
+		Results.Storage[key] = make(map[common.Hash]common.Hash)
+		for key2, val2 := range pendingStorage {
+			Results.Storage[key][key2] = val2
 		}
-		// Finalize the state so any modifications are written to the trie
-		// Only delete empty objects if EIP158/161 (a.k.a Spurious Dragon) is in effect
-		statedb.Finalise(vmenv.ChainConfig().IsEIP158(block.Number()))
+		data := val.Getdata()
+		Results.Balance[key] = data.Balance
 	}
-	close(jobs)
-	pend.Wait()
-
-	// If execution failed in between, abort
-	if failed != nil {
-		return nil, failed
+	logs := statedb.Getlogs()
+	for key, val := range logs {
+		Results.Logs[key] = val
 	}
-	return results, nil
+	var temp txTraceResult
+	temp.Result = Results
+	var Result []*txTraceResult
+	Result = append(Result, &temp)
+	return Result, nil
 }
 
 // standardTraceBlockToFile configures a new tracer which uses standard JSON output,

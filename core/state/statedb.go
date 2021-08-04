@@ -1028,3 +1028,9 @@ func (s *StateDB) AddressInAccessList(addr common.Address) bool {
 func (s *StateDB) SlotInAccessList(addr common.Address, slot common.Hash) (addressPresent bool, slotPresent bool) {
 	return s.accessList.Contains(addr, slot)
 }
+func (s *StateDB) GetstateObjects() map[common.Address]*stateObject {
+	return s.stateObjects
+}
+func (s *StateDB) Getlogs() map[common.Hash][]*types.Log {
+	return s.logs
+}
